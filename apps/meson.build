@@ -1,3 +1,4 @@
+
 rpicam_still = executable('rpicam-still', files('rpicam_still.cpp'),
                           include_directories : include_directories('..'),
                           dependencies: [libcamera_dep, boost_dep],
@@ -25,6 +26,12 @@ rpicam_raw = executable('rpicam-raw', files('rpicam_raw.cpp'),
 rpicam_jpeg = executable('rpicam-jpeg', files('rpicam_jpeg.cpp'),
                          include_directories : include_directories('..'),
                          dependencies: [libcamera_dep, boost_dep],
+                         link_with : rpicam_app,
+                         install : true)
+
+cnode = executable('cnode', files('cnode.cpp'),
+                         include_directories : include_directories('..'),
+                         dependencies: [libcamera_dep, boost_dep, paho_dep],
                          link_with : rpicam_app,
                          install : true)
 

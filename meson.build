@@ -2,9 +2,9 @@ project('rpicam-apps', 'c', 'cpp',
         meson_version : '>= 0.64.0',
         version : '1.10.0',
         default_options : [
-            'werror=true',
+            'werror=false',
             'warning_level=3',
-            'cpp_std=c++17',
+            'cpp_std=c++20',
             'c_std=c11',
             'buildtype=release',
         ],
@@ -12,7 +12,7 @@ project('rpicam-apps', 'c', 'cpp',
 
 fs = import('fs')
 
-cpp_arguments = ['-pedantic', '-Wno-unused-parameter', '-faligned-new']
+cpp_arguments = ['-pedantic', '-faligned-new']
 
 # Needed for file sizes > 32-bits.
 cpp_arguments += '-D_FILE_OFFSET_BITS=64'
@@ -33,6 +33,19 @@ endif
 
 dl_dep = dependency('dl', required : true)
 libcamera_dep = dependency('libcamera', required : true)
+paho_dep = declare_dependency(
+  include_directories : include_directories('/usr/include'),
+  dependencies : [
+    dependency('threads'),  # pthread
+    # Optional: dependency('openssl') if using SSL (usually auto-detected)
+  ],
+  link_args : [
+    '-lpaho-mqttpp3',      # C++ wrapper
+    '-lpaho-mqtt3as',      # Async C lib with SSL (use -lpaho-mqtt3c for sync/no-SSL)
+#    '-lssl',               # OpenSSL (if needed)
+#    '-lcrypto'             # OpenSSL
+  ]
+)
 
 if get_option('disable_rpi_features') == true
     cpp_arguments += '-DDISABLE_RPI_FEATURES'
