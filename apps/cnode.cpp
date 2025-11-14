@@ -6,6 +6,8 @@
  */
 
 #include <chrono>
+#include <fstream>
+#include <sstream>
 
 #include "mqtt/async_client.h"
 
@@ -39,15 +41,18 @@ public:
     StillOptions *GetOptions() const { return static_cast<StillOptions *>(RPiCamApp::GetOptions()); }
 };
 
-// The main event loop for the application.
 
-void capture_frame(RPiCamJpegApp &app)
+
+std::basic_ostringstream<char> capture_frame(RPiCamJpegApp &app)
 {
     StillOptions const *options = app.GetOptions();
     app.OpenCamera();
-    app.ConfigureViewfinder();
+    //app.ConfigureViewfinder();
+    app.ConfigureStill();
     app.StartCamera();
     auto start_time = std::chrono::high_resolution_clock::now();
+
+    std::basic_ostringstream<char> buff {std::ios::binary};
 
     while (true) {
         RPiCamApp::Msg msg = app.Wait();
@@ -59,12 +64,12 @@ void capture_frame(RPiCamJpegApp &app)
         }
 
         if (msg.type == RPiCamApp::MsgType::Quit) {
-            return;
+            break;
         }
         else if (msg.type != RPiCamApp::MsgType::RequestComplete) {
             throw std::runtime_error("unrecognised message!");
         }
-        else {
+        else if (app.StillStream()) {
             app.StopCamera();
             LOG(1, "Still capture image received");
 
@@ -73,49 +78,21 @@ void capture_frame(RPiCamJpegApp &app)
             CompletedRequestPtr &payload = std::get<CompletedRequestPtr>(msg.payload);
             BufferReadSync r(&app, payload->buffers[stream]);
             const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
-            jpeg_save(mem, info, payload->metadata, options->Get().output, app.CameraModel(), options);
-            return;
+            jpeg_write(mem, info, payload->metadata, buff, app.CameraModel(), options);
+            break;
         }
     }
-}
-
-int main(int argc, char *argv[])
-{
-    try {
-        RPiCamJpegApp app;
-        StillOptions *options = app.GetOptions();
-        if (options->Parse(argc, argv)) {
-            if (options->Get().verbose >= 2) { options->Get().Print(); }
-            if (options->Get().output.empty()) {
-                throw std::runtime_error("output file name required");
-            }
-
-            capture_frame(app);
-
-            options->Get().output
-        }
-    }
-    catch (std::exception const &e) {
-        LOG_ERROR("ERROR: *** " << e.what() << " ***");
-        return -1;
-    }
-    return 0;
+    return buff;
 }
 
 
-const std::string LWT_TOPIC				{ "events/disconnect" };
-const std::string LWT_PAYLOAD			{ "Last will and testament." };
-
-const int  QOS = 1;
-const auto TIMEOUT = std::chrono::seconds(10);
-
-
-void send_frame(
-    std::string const & broker_url,
-    std::string const & client_id,
-    std::string const & frame_file_path)
+void send_frame(RPiCamJpegApp & app, std::basic_ostringstream<char> & buff)
 {
     using namespace std;
+
+    const int  QOS = 1;
+
+    StillOptions const * options = app.GetOptions();
 /*
     // Note that we don't actually need to open the trust or key stores.
     // We just need a quick, portable way to check that they exist.
@@ -135,8 +112,8 @@ void send_frame(
         }
     }
 */
-    cout << "Initializing for server '" << broker_url << "'..." << endl;
-    mqtt::async_client client(broker_url, client_id);
+    cout << "Initializing for server '" << options->Get().mqtt_host << "'..." << endl;
+    mqtt::async_client client(options->Get().mqtt_host, options->Get().mqtt_client_id);
 
     callback cb;
     client.set_callback(cb);
@@ -148,12 +125,9 @@ void send_frame(
                        .error_handler([](const std::string &msg) { std::cerr << "SSL Error: " << msg << std::endl; })
                        .finalize();
 */
-    auto willmsg = mqtt::message(LWT_TOPIC, LWT_PAYLOAD, QOS, true);
-
     auto connopts = mqtt::connect_options_builder()
                         .user_name("testuser")
                         .password("testpassword")
-                        .will(std::move(willmsg))
                         //.ssl(std::move(sslopts))
                         .finalize();
 
@@ -161,7 +135,6 @@ void send_frame(
 
     try {
         // Connect using SSL/TLS
-
         cout << "\nConnecting..." << endl;
         mqtt::token_ptr conntok = client.connect(connopts);
         cout << "Waiting for the connection..." << endl;
@@ -169,10 +142,9 @@ void send_frame(
         cout << "  ...OK" << endl;
 
         // Send a message
-
-        cout << "\nSending message..." << endl;
-        auto msg = mqtt::make_message("hello", "Hello secure C++ world!", QOS, false);
-        client.publish(msg)->wait_for(TIMEOUT);
+        cout << "\nSending message to topic " << options->Get().mqtt_topic  << endl;
+        auto msg = mqtt::make_message(options->Get().mqtt_topic, buff.str(), QOS, false);
+        client.publish(msg)->wait_for(20000);
         cout << "  ...OK" << endl;
 
         // Disconnect
@@ -183,8 +155,33 @@ void send_frame(
     }
     catch (const mqtt::exception &exc) {
         cerr << exc.what() << endl;
-        return 1;
+        return;
     }
 
+    return;
+}
+
+
+int main(int argc, char *argv[])
+{
+    try {
+        RPiCamJpegApp app;
+        StillOptions *options = app.GetOptions();
+        if (options->Parse(argc, argv)) {
+            if (options->Get().verbose >= 2) { options->Get().Print(); }
+            if (options->Get().output.empty()) {
+                throw std::runtime_error("output file name required");
+            }
+
+            std::basic_ostringstream<char> buff = capture_frame(app);
+            send_frame(app, buff);
+
+            //options->Get().output
+        }
+    }
+    catch (std::exception const &e) {
+        LOG_ERROR("ERROR: *** " << e.what() << " ***");
+        return -1;
+    }
     return 0;
 }

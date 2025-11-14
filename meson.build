@@ -6,27 +6,27 @@ project('rpicam-apps', 'c', 'cpp',
             'warning_level=3',
             'cpp_std=c++20',
             'c_std=c11',
-            'buildtype=release',
+            'buildtype=debug',
         ],
         license : 'BSD-2-Clause')
 
 fs = import('fs')
 
-cpp_arguments = ['-pedantic', '-faligned-new']
+cpp_arguments = ['-pedantic', '-faligned-new', '-O0', '-g']
 
 # Needed for file sizes > 32-bits.
-cpp_arguments += '-D_FILE_OFFSET_BITS=64'
+cpp_arguments += ['-D_FILE_OFFSET_BITS=64']
 
 cxx = meson.get_compiler('cpp')
 cpu = host_machine.cpu()
 neon = get_option('neon_flags')
 
 if cxx.get_id() == 'gcc'
-    cpp_arguments += '-Wno-psabi'
+    cpp_arguments += ['-Wno-psabi']
 endif
 
 if cpu == 'aarch64' or neon == 'arm64'
-    cpp_arguments += '-ftree-vectorize'
+    cpp_arguments += ['-ftree-vectorize']
 elif neon == 'armv8-neon'
     cpp_arguments += ['-mfpu=neon-fp-armv8', '-ftree-vectorize']
 endif
@@ -77,13 +77,13 @@ configure_file(output : 'config.h', configuration : conf_data)
 # Generate a version string.
 version_cmd = [meson.project_source_root() / 'utils' / 'version.py', meson.project_version()]
 
-version_cpp = vcs_tag(command : version_cmd,
-                      replace_string: '@VER@',
-                      input : meson.project_source_root() / 'core' / 'version.cpp.in',
-                      output : 'version.cpp',
-                      fallback : meson.project_version())
+#version_cpp = vcs_tag(command : version_cmd,
+#                      replace_string: '@VER@',
+#                      input : meson.project_source_root() / 'core' / 'version.cpp.in',
+#                      output : 'version.cpp',
+#                      fallback : meson.project_version())
 
-rpicam_app_src += version_cpp
+rpicam_app_src += 'core/version.cpp'
 
 rpicam_app = library(
     'rpicam_app',
