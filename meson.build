@@ -46,6 +46,7 @@ paho_dep = declare_dependency(
 #    '-lcrypto'             # OpenSSL
   ]
 )
+libcbor_dep = dependency('libcbor', required : true)
 
 if get_option('disable_rpi_features') == true
     cpp_arguments += '-DDISABLE_RPI_FEATURES'

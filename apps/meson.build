@@ -31,7 +31,7 @@ rpicam_jpeg = executable('rpicam-jpeg', files('rpicam_jpeg.cpp'),
 
 cnode = executable('cnode', files('cnode.cpp'),
                          include_directories : include_directories('..'),
-                         dependencies: [libcamera_dep, boost_dep, paho_dep],
+                         dependencies: [libcamera_dep, boost_dep, paho_dep, libcbor_dep],
                          link_with : rpicam_app,
                          install : true)
 

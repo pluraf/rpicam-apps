@@ -8,7 +8,10 @@
 #include <chrono>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
+#include <string>
 
+#include <cbor.h>
 #include "mqtt/async_client.h"
 
 #include "core/rpicam_app.hpp"
@@ -86,7 +89,7 @@ std::basic_ostringstream<char> capture_frame(RPiCamJpegApp &app)
 }
 
 
-void send_frame(RPiCamJpegApp & app, std::basic_ostringstream<char> & buff)
+void send_frame(RPiCamJpegApp &app, std::string &buff)
 {
     using namespace std;
 
@@ -143,7 +146,7 @@ void send_frame(RPiCamJpegApp & app, std::basic_ostringstream<char> & buff)
 
         // Send a message
         cout << "\nSending message to topic " << options->Get().mqtt_topic  << endl;
-        auto msg = mqtt::make_message(options->Get().mqtt_topic, buff.str(), QOS, false);
+        auto msg = mqtt::make_message(options->Get().mqtt_topic, buff, QOS, false);
         client.publish(msg)->wait_for(20000);
         cout << "  ...OK" << endl;
 
@@ -162,6 +165,18 @@ void send_frame(RPiCamJpegApp & app, std::basic_ostringstream<char> & buff)
 }
 
 
+std::string get_iso_datetime()
+{
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+
+    std::stringstream ss;
+    ss << std::put_time(std::gmtime(&now_time), "%Y-%m-%dT%H:%M:%SZ");
+
+    return ss.str();
+}
+
+
 int main(int argc, char *argv[])
 {
     try {
@@ -174,9 +189,49 @@ int main(int argc, char *argv[])
             }
 
             std::basic_ostringstream<char> buff = capture_frame(app);
-            send_frame(app, buff);
 
-            //options->Get().output
+            // Create keys (text strings)
+            cbor_item_t* key_cnode_id = cbor_build_string("cnode_id");
+            cbor_item_t* key_created = cbor_build_string("created");
+            cbor_item_t* key_frame = cbor_build_string("frame");
+
+            // Create values
+            cbor_item_t* val_cnode_id = cbor_build_string("1");
+            auto timestamp = get_iso_datetime();
+            cbor_item_t* val_created = cbor_build_string(timestamp.c_str());
+
+            // Binary data as byte string
+            auto frame = buff.str();
+            cbor_item_t* val_binary = cbor_build_bytestring(
+                reinterpret_cast<cbor_data>(frame.c_str()),
+                frame.length()
+            );
+
+            cbor_item_t* map = cbor_new_definite_map(3);
+
+            cbor_map_add(map, (struct cbor_pair){ .key = key_cnode_id, .value = val_cnode_id });
+            cbor_map_add(map, (struct cbor_pair){ .key = key_created, .value = val_created });
+            cbor_map_add(map, (struct cbor_pair){ .key = key_frame, .value = val_binary });
+
+            // Serialize the map
+            unsigned char *buffer = nullptr;
+            size_t buffer_size = 0;
+            size_t serialized_length = cbor_serialize_alloc(map, &buffer, &buffer_size);
+
+            if (serialized_length == 0) {
+                std::cerr << "Serialization failed" << std::endl;
+                return 1;
+            }
+
+            auto payload = std::string(
+                reinterpret_cast<char *>(buffer),
+                reinterpret_cast<char *>(buffer + buffer_size)
+            );
+
+            send_frame(app, payload);
+
+            free(buffer);
+            cbor_decref(&map);
         }
     }
     catch (std::exception const &e) {
