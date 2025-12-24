@@ -288,6 +288,8 @@ struct OptsInternal {
     std::string mqtt_host;
     std::string mqtt_client_id;
     std::string mqtt_topic;
+
+    std::string object;
 };
 
 struct Options {

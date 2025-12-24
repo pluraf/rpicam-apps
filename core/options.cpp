@@ -317,6 +317,7 @@ Options::Options()
         "mqtt_topic")
     ("mqtt_client_id", value<std::string>(&v_->mqtt_client_id),
         "mqtt_client_id")
+    ("object", value<std::string>(&v_->object), "Name of object to detect")
   ;
     // clang-format on
 

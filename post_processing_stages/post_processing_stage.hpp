@@ -96,6 +96,7 @@ protected:
 };
 
 typedef PostProcessingStage *(*StageCreateFunc)(RPiCamApp *app);
+
 struct RegisterStage
 {
 	RegisterStage(char const *name, StageCreateFunc create_func);

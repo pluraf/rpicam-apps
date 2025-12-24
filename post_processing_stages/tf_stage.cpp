@@ -115,6 +115,7 @@ bool TfStage::Process(CompletedRequestPtr &completed_request)
 				if (config_->verbose)
 					LOG(1, "TfStage: Inference time: " << time_taken << " ms");
 			});
+			future_->wait();
 		}
 	}
 

@@ -1,0 +1,1 @@
+./build/apps/cnode -n -t 1ms -o f --mqtt_topic hello --mqtt_host 192.168.1.88 --mqtt_client_id ff --post-process-file object_detect_tf.json --post-process-libs /home/plrf/repos/rpicam-apps/build/post_processing_stages --lores-width 300 --lores-height 300 --object person --verbose 1

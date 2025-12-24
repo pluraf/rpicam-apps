@@ -19,6 +19,9 @@
 
 #include "image/image.hpp"
 
+#include "post_processing_stages/object_detect.hpp"
+
+
 class callback : public virtual mqtt::callback {
 public:
     void connection_lost(const std::string &cause) override
@@ -50,7 +53,6 @@ std::basic_ostringstream<char> capture_frame(RPiCamJpegApp &app)
 {
     StillOptions const *options = app.GetOptions();
     app.OpenCamera();
-    //app.ConfigureViewfinder();
     app.ConfigureStill();
     app.StartCamera();
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -75,13 +77,28 @@ std::basic_ostringstream<char> capture_frame(RPiCamJpegApp &app)
         else if (app.StillStream()) {
             app.StopCamera();
             LOG(1, "Still capture image received");
+            CompletedRequestPtr &completed_request = std::get<CompletedRequestPtr>(msg.payload);
+
+            std::vector<Detection> detections;
+            bool detected {false};
+            if(completed_request->post_process_metadata.Get(
+                "object_detect.results", detections) == 0){
+                    detected = (std::find_if(
+                        detections.begin(),
+                        detections.end(),
+                        [options](const Detection &d){
+                            return d.name.find(options->Get().object) != std::string::npos;
+                        }
+                    ) != detections.end());
+            }
+
+            std::cout << detected << std::endl;
 
             Stream *stream = app.StillStream();
             StreamInfo info = app.GetStreamInfo(stream);
-            CompletedRequestPtr &payload = std::get<CompletedRequestPtr>(msg.payload);
-            BufferReadSync r(&app, payload->buffers[stream]);
+            BufferReadSync r(&app, completed_request->buffers[stream]);
             const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
-            jpeg_write(mem, info, payload->metadata, buff, app.CameraModel(), options);
+            jpeg_write(mem, info, completed_request->metadata, buff, app.CameraModel(), options);
             break;
         }
     }
