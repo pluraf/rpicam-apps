@@ -10,6 +10,9 @@
 #include <sstream>
 #include <iomanip>
 #include <string>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/i2c-dev.h>
 
 #include <cbor.h>
 #include "mqtt/async_client.h"
@@ -20,6 +23,14 @@
 #include "image/image.hpp"
 
 #include "post_processing_stages/object_detect.hpp"
+
+
+struct sensor_data_t
+{
+    float temperature;
+    float voltage;
+    float current;
+};
 
 
 class callback : public virtual mqtt::callback {
@@ -194,6 +205,118 @@ std::string get_iso_datetime()
 }
 
 
+float read_temperature(int file)
+{
+    unsigned char reg = 50;
+    if( write(file, & reg, 1) != 1 )
+    {
+        return -255;
+    }
+
+    unsigned char value[2];
+
+    if( read(file, value, 2) != 2 )
+    {
+        return -255;
+    }
+
+    return (float)((int16_t)((value[0] << 8) | value[1]) >> 7) / 2;
+}
+
+
+float read_voltage(int file)
+{
+    unsigned char reg;
+    unsigned char value;
+    float result;
+
+    reg = 1;
+    if( write(file, & reg, 1) != 1 )
+    {
+        return -255;
+    }
+    if( read(file, & value, 1) != 1 )
+    {
+        return -255;
+    }
+    result = value;
+
+    reg = 2;
+    if( write(file, & reg, 1) != 1 )
+    {
+        return -255;
+    }
+    if( read(file, & value, 1) != 1 )
+    {
+        return -255;
+    }
+
+    return result + (float)value / 100;
+}
+
+
+float read_current(int file)
+{
+    unsigned char reg;
+    unsigned char value;
+    float result;
+
+    reg = 5;
+    if( write(file, & reg, 1) != 1 )
+    {
+        return -255;
+    }
+    if( read(file, & value, 1) != 1 )
+    {
+        return -255;
+    }
+    result = value;
+
+    reg = 6;
+    if( write(file, & reg, 1) != 1 )
+    {
+        return -255;
+    }
+    if( read(file, & value, 1) != 1 )
+    {
+        return -255;
+    }
+
+    return result + (float)value / 100;
+}
+
+
+sensor_data_t read_sensors()
+{
+    char const * i2c_device = "/dev/i2c-1";
+    int const sensor_address = 0x08;
+
+    int file = open(i2c_device, O_RDWR);
+    if( file < 0 )
+    {
+        std::cerr << "Failed to open I2C bus" << std::endl;
+        return { -255, -255, -255 };
+    }
+
+    if( ioctl(file, I2C_SLAVE, sensor_address) < 0 )
+    {
+        std::cerr << "Failed to acquire bus access or talk to slave" << std::endl;
+        close(file);
+        return { -255, -255, -255 };
+    }
+
+    sensor_data_t sd = {
+        read_temperature(file),
+        read_voltage(file),
+        read_current(file)
+    };
+
+    close(file);
+
+    return sd;
+}
+
+
 int main(int argc, char *argv[])
 {
     try {
@@ -211,12 +334,14 @@ int main(int argc, char *argv[])
             cbor_item_t* key_cnode_id = cbor_build_string("cnode_id");
             cbor_item_t* key_created = cbor_build_string("created");
             cbor_item_t* key_frame = cbor_build_string("frame");
+            cbor_item_t* key_temperature = cbor_build_string("temperature");
+            cbor_item_t* key_battery_voltage = cbor_build_string("battery_voltage");
+            cbor_item_t* key_current = cbor_build_string("current");
 
             // Create values
             cbor_item_t* val_cnode_id = cbor_build_string("1");
             auto timestamp = get_iso_datetime();
             cbor_item_t* val_created = cbor_build_string(timestamp.c_str());
-
             // Binary data as byte string
             auto frame = buff.str();
             cbor_item_t* val_binary = cbor_build_bytestring(
@@ -224,11 +349,22 @@ int main(int argc, char *argv[])
                 frame.length()
             );
 
-            cbor_item_t* map = cbor_new_definite_map(3);
+            sensor_data_t sd { read_sensors() };
+            // Temperature
+            cbor_item_t* val_temperature = cbor_build_float4(sd.temperature);
+            // Battery
+            cbor_item_t* val_battery_voltage = cbor_build_float4(sd.voltage);
+            // Current
+            cbor_item_t* val_current = cbor_build_float4(sd.current);
+
+            cbor_item_t* map = cbor_new_definite_map(6);
 
             cbor_map_add(map, (struct cbor_pair){ .key = key_cnode_id, .value = val_cnode_id });
             cbor_map_add(map, (struct cbor_pair){ .key = key_created, .value = val_created });
             cbor_map_add(map, (struct cbor_pair){ .key = key_frame, .value = val_binary });
+            cbor_map_add(map, (struct cbor_pair){ .key = key_temperature, .value = val_temperature });
+            cbor_map_add(map, (struct cbor_pair){ .key = key_battery_voltage, .value = val_battery_voltage });
+            cbor_map_add(map, (struct cbor_pair){ .key = key_current, .value = val_current });
 
             // Serialize the map
             unsigned char *buffer = nullptr;
