@@ -5,17 +5,21 @@
  * rpicam_jpeg.cpp - minimal libcamera jpeg capture app.
  */
 
+#include <stdexcept>
 #include <chrono>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <string>
+#include <array>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/i2c-dev.h>
 
+#include <nlohmann/json.hpp>
 #include <cbor.h>
-#include "mqtt/async_client.h"
+
+#include "mqtt/client.h"
 
 #include "core/rpicam_app.hpp"
 #include "core/still_options.hpp"
@@ -25,28 +29,429 @@
 #include "post_processing_stages/object_detect.hpp"
 
 
+template< uint8_t End, uint8_t Start >
+struct BitField
+{
+    static constexpr uint8_t pos = Start;
+    static constexpr uint8_t mask = ((1u << (End - Start + 1)) - 1) << Start;
+};
+
+
+struct RegField
+{
+    uint8_t pos{};
+    uint8_t mask{};
+
+    template< uint8_t End, uint8_t Start >
+    RegField( BitField<End, Start> bf ): pos(bf.pos), mask(bf.mask) {}
+};
+
+
+template< typename T >
+struct REG
+{
+    T val_{};
+
+    uint8_t VALUE(){ return val_; };
+
+    REG & RESET(){ val_ = 0; return * this; }
+
+    REG & SET(RegField rf, uint8_t value)
+    {
+        val_ &= ~ rf.mask;
+        val_ |= (value << rf.pos) & rf.mask;
+
+        return *this;
+    }
+
+    REG & SET(RegField rf)
+    {
+        SET(rf, 1);
+
+        return *this;
+    }
+
+    REG & SET(T value)
+    {
+        val_ = value;
+
+        return *this;
+    }
+
+    T GET(RegField const & rf){ return (val_ & rf.mask) >> rf.pos; }
+};
+
+
 struct sensor_data_t
 {
     float temperature;
     float voltage;
     float current;
+    uint16_t als_data;
 };
 
 
-class callback : public virtual mqtt::callback {
+class I2C_Device
+{
+protected:
+    int handler_ {};
+
 public:
-    void connection_lost(const std::string &cause) override
+    I2C_Device(std::string const & i2c_bus, int const i2c_address)
     {
-        std::cout << "\nConnection lost" << std::endl;
-        if (!cause.empty())
-            std::cout << "\tcause: " << cause << std::endl;
+        handler_ = open(i2c_bus.c_str(), O_RDWR);
+        if( handler_ < 0 )
+        {
+            throw std::runtime_error("Failed to open I2C bus!");
+        }
+
+        if( ioctl(handler_, I2C_SLAVE, i2c_address) < 0 )
+        {
+            close(handler_);
+            throw std::runtime_error("Failed to acquire I2C bus access!");
+        }
     }
 
-    void delivery_complete(mqtt::delivery_token_ptr tok) override
+    ~I2C_Device()
     {
-        std::cout << "\tDelivery complete for token: " << (tok ? tok->get_message_id() : -1) << std::endl;
+        close(handler_);
+    }
+
+    void writeN(uint8_t addr, uint8_t * buffer, uint8_t n)
+    {
+        if( write(handler_, buffer, n) != n )
+        {
+            throw std::runtime_error("I2C Bus Operation Failed!");
+        }
+    }
+
+    void write8(uint8_t addr, uint8_t val)
+    {
+        constexpr unsigned N = 2;
+
+        uint8_t buffer[N] = { addr, val };
+
+        if( write(handler_, buffer, N) != N )
+        {
+            throw std::runtime_error("I2C Bus Operation Failed!");
+        }
+    }
+
+    void write8(uint8_t val)
+    {
+        constexpr unsigned N = 1;
+
+        uint8_t buffer[N] = { val };
+
+        if( write(handler_, buffer, N) != N )
+        {
+            throw std::runtime_error("I2C Bus Operation Failed!");
+        }
+    }
+
+    uint8_t read8(uint8_t addr)
+    {
+        if( write(handler_, & addr, 1) != 1 )
+        {
+            throw std::runtime_error("I2C Bus Operation Failed!");
+        }
+
+        constexpr unsigned N = 1;
+
+        uint8_t buffer[N];
+
+        if( read(handler_, buffer, N) != N )
+        {
+            throw std::runtime_error("I2C Bus Operation Failed!");
+        }
+
+        return buffer[0];
+    }
+
+    uint16_t read16(uint8_t addr)
+    {
+        if( write(handler_, & addr, 1) != 1 )
+        {
+            throw std::runtime_error("I2C Bus Operation Failed!");
+        }
+
+        constexpr unsigned N = 2;
+
+        uint8_t buffer[N];
+
+        if( read(handler_, buffer, N) != N )
+        {
+            throw std::runtime_error("I2C Bus Operation Failed!");
+        }
+
+        std::cout << std::hex << (int)buffer[0] << std::endl;
+        std::cout << std::hex << (int)buffer[1] << std::endl;
+
+        return (buffer[1] << 8) | buffer[0];
     }
 };
+
+
+namespace TSL2591
+{
+struct REG_COMMAND: public REG<uint8_t>
+{
+    static BitField< 7, 7 > CMD_FIELD;
+    static BitField< 6, 5 > TRANSACTION_FIELD;
+    static BitField< 4, 0 > ADDR_SF_FIELD;
+
+    static constexpr uint8_t TRANSACTION_NORMAL = 0b01;
+    static constexpr uint8_t TRANSACTION_SPECIAL = 0b11;
+
+    static constexpr uint8_t SF_CLEAR_INTERRUPTS = 0b00111;
+};
+
+struct REG_CONTROL: public REG<uint8_t>
+{
+    static constexpr uint8_t ADDR = 0x01;
+
+    static BitField< 5, 4 > AGAIN_FIELD;
+    static BitField< 2, 0 > ATIME_FIELD;
+
+    static constexpr uint8_t GAIN_LOW = 0b00;
+    static constexpr uint8_t GAIN_MEDIUM = 0b01;
+    static constexpr uint8_t GAIN_HIGH = 0b10;
+    static constexpr uint8_t GAIN_MAXIMUM = 0b11;
+
+    static constexpr uint8_t TIME_100MS = 0b000;
+    static constexpr uint8_t TIME_200MS = 0b001;
+    static constexpr uint8_t TIME_300MS = 0b010;
+    static constexpr uint8_t TIME_400MS = 0b011;
+    static constexpr uint8_t TIME_500MS = 0b100;
+    static constexpr uint8_t TIME_600MS = 0b101;
+};
+
+struct REG_ENABLE: public REG<uint8_t>
+{
+    static constexpr uint8_t ADDR = 0x00;
+
+    static BitField< 0, 0 > PON;
+    static BitField< 1, 1 > AEN;
+    static BitField< 4, 4 > AIEN;
+    static BitField< 6, 6 > SAI;
+    static BitField< 7, 7 > NPIEN;
+};
+
+struct REG_NPAIHTL: public REG<uint8_t>
+{
+    static constexpr uint8_t ADDR = 0x0A;
+};
+
+struct REG_NPAIHTH: public REG<uint8_t>
+{
+    static constexpr uint8_t ADDR = 0x0B;
+};
+
+struct REG_C0DATAL: public REG<uint8_t>
+{
+    static constexpr uint8_t ADDR = 0x14;
+};
+
+struct REG_C0DATAH: public REG<uint8_t>
+{
+    static constexpr uint8_t ADDR = 0x15;
+};
+
+struct REG_C1DATAL: public REG<uint8_t>
+{
+    static constexpr uint8_t ADDR = 0x16;
+};
+
+struct REG_C1DATAH: public REG<uint8_t>
+{
+    static constexpr uint8_t ADDR = 0x17;
+};
+
+class TSL2591_Sensor: public I2C_Device
+{
+public:
+
+    TSL2591_Sensor(std::string const & i2c_bus, int const i2c_address)
+            :I2C_Device(i2c_bus, i2c_address)
+    {}
+
+    enum class CHANNEL{ CH0, CH1 };
+
+    uint16_t read_als(CHANNEL channel)
+    {
+        using namespace TSL2591;
+
+        REG<uint8_t> reg;
+        reg
+            .SET(REG_COMMAND::CMD_FIELD)
+            .SET(REG_COMMAND::TRANSACTION_FIELD, REG_COMMAND::TRANSACTION_NORMAL);
+
+        switch( channel )
+        {
+        case CHANNEL::CH0:
+            reg.SET(REG_COMMAND::ADDR_SF_FIELD, REG_C0DATAL::ADDR);
+            break;
+        case CHANNEL::CH1:
+            reg.SET(REG_COMMAND::ADDR_SF_FIELD, REG_C1DATAL::ADDR);
+            break;
+        }
+
+        return read16(reg.VALUE());
+    }
+
+    void setup()
+    {
+        using namespace TSL2591;
+
+        REG<uint8_t> reg_addr;
+        REG<uint8_t> reg_val;
+
+        reg_addr
+            .SET(REG_COMMAND::CMD_FIELD)
+            .SET(REG_COMMAND::TRANSACTION_FIELD, REG_COMMAND::TRANSACTION_NORMAL);
+
+        reg_addr.SET(REG_COMMAND::ADDR_SF_FIELD, REG_ENABLE::ADDR);
+        auto status = read8(reg_addr.VALUE());
+
+        // If value of Enable register is already set to the desired value,
+        // the sensor has alreay been configured
+        if( (REG_ENABLE::PON.mask & status) && (REG_ENABLE::AEN.mask & status) )
+        {
+            return;
+        }
+
+        reg_val
+            .RESET()
+            .SET(REG_ENABLE::PON)
+            .SET(REG_ENABLE::AEN);
+        reg_addr.SET(REG_COMMAND::ADDR_SF_FIELD, REG_ENABLE::ADDR);
+        write8(reg_addr.VALUE(), reg_val.VALUE());
+
+        reg_val
+            .RESET()
+            .SET(REG_CONTROL::AGAIN_FIELD, REG_CONTROL::GAIN_HIGH)
+            .SET(REG_CONTROL::ATIME_FIELD, REG_CONTROL::TIME_500MS);
+        reg_addr.SET(REG_COMMAND::ADDR_SF_FIELD, REG_CONTROL::ADDR);
+        write8(reg_addr.VALUE(), reg_val.VALUE());
+    }
+
+    void enable_interrupt()
+    {
+        using namespace TSL2591;
+
+        REG<uint8_t> reg_val;
+        REG<uint8_t> reg_addr;
+
+        reg_addr
+            .SET(REG_COMMAND::CMD_FIELD)
+            .SET(REG_COMMAND::TRANSACTION_FIELD, REG_COMMAND::TRANSACTION_SPECIAL)
+            .SET(REG_COMMAND::ADDR_SF_FIELD, REG_COMMAND::SF_CLEAR_INTERRUPTS);
+        write8(reg_addr.VALUE());
+
+        reg_addr
+            .RESET()
+            .SET(REG_COMMAND::CMD_FIELD)
+            .SET(REG_COMMAND::TRANSACTION_FIELD, REG_COMMAND::TRANSACTION_NORMAL);
+
+        reg_val
+            .RESET();
+        reg_addr.SET(REG_COMMAND::ADDR_SF_FIELD, REG_NPAIHTH::ADDR);
+        write8(reg_addr.VALUE(), reg_val.VALUE());
+
+        reg_val
+            .RESET()
+            .SET(0xFF);
+        reg_addr.SET(REG_COMMAND::ADDR_SF_FIELD, REG_NPAIHTL::ADDR);
+        write8(reg_addr.VALUE(), reg_val.VALUE());
+
+        reg_val
+            .RESET()
+            .SET(REG_ENABLE::PON)
+            .SET(REG_ENABLE::AEN)
+            .SET(REG_ENABLE::NPIEN);
+        reg_addr.SET(REG_COMMAND::ADDR_SF_FIELD, REG_ENABLE::ADDR);
+        write8(reg_addr.VALUE(), reg_val.VALUE());
+
+        std::cout << "SETUP DONE" << std::endl;
+    }
+};
+
+}
+
+
+struct CNodeConfig
+{
+    bool stay_awake{ false };
+    uint32_t wakeup_interval{ 30 };  // minutes
+    std::string ca_certificate_file;
+    std::string config_topic { "/cnode/1/config" };
+    std::string data_topic { "/cnode/1/data" };
+} G_config;
+
+
+class MQTTAgent
+{
+    class Callback;
+    mqtt::client_ptr  client_ptr_;
+public:
+    MQTTAgent(std::string const & server, std::string const & client_id)
+    {
+        // Create MQTT Client
+        client_ptr_ = std::make_shared<mqtt::client>(
+            server, client_id, mqtt::create_options(MQTTVERSION_5)
+        );
+    }
+
+    void connect()
+    {
+        mqtt::connect_options conn_opts;
+
+        conn_opts.set_clean_session(false);
+        conn_opts.set_mqtt_version(MQTTVERSION_5);
+
+        conn_opts.set_user_name("testuser");
+        conn_opts.set_password("testpassword");
+
+        auto server = client_ptr_->get_server_uri();
+
+        if(server.starts_with("ssl") || server.starts_with("tls")){
+            mqtt::ssl_options sslopts;
+            sslopts.set_verify(true);
+            sslopts.set_enable_server_cert_auth(true);
+            sslopts.set_trust_store(G_config.ca_certificate_file);
+            conn_opts.set_ssl(sslopts);
+        }
+        auto response = client_ptr_->connect(conn_opts);
+    }
+
+    void send(std::string const & topic, std::string const & payload)
+    {
+        try {
+            client_ptr_->publish(topic, payload.c_str(), payload.size());
+        }
+        catch (const mqtt::exception& exc) {
+            std::cerr << exc << std::endl;
+            throw std::runtime_error("Unable to send message to MQTT server");
+        }
+    }
+
+    void subscribe()
+    {
+        client_ptr_->subscribe(G_config.config_topic, 1);
+    }
+
+    std::string receive_config()
+    {
+        mqtt::const_message_ptr msg;
+        if( client_ptr_->try_consume_message_for(& msg, std::chrono::seconds(10)) )
+        {
+            return msg.get()->get_payload_str();
+        }
+
+        return "";
+    }
+};
+
 
 using namespace std::placeholders;
 using libcamera::Stream;
@@ -60,15 +465,14 @@ public:
 
 
 
-std::basic_ostringstream<char> capture_frame(RPiCamJpegApp &app)
+bool capture_frame(RPiCamJpegApp & app, std::basic_ostringstream<char> & buff)
 {
     StillOptions const *options = app.GetOptions();
     app.OpenCamera();
     app.ConfigureStill();
     app.StartCamera();
     auto start_time = std::chrono::high_resolution_clock::now();
-
-    std::basic_ostringstream<char> buff {std::ios::binary};
+    bool detected{ false };
 
     while (true) {
         RPiCamApp::Msg msg = app.Wait();
@@ -88,10 +492,9 @@ std::basic_ostringstream<char> capture_frame(RPiCamJpegApp &app)
         else if (app.StillStream()) {
             app.StopCamera();
             LOG(1, "Still capture image received");
-            CompletedRequestPtr &completed_request = std::get<CompletedRequestPtr>(msg.payload);
+            CompletedRequestPtr & completed_request = std::get<CompletedRequestPtr>(msg.payload);
 
             std::vector<Detection> detections;
-            bool detected {false};
             if(completed_request->post_process_metadata.Get(
                 "object_detect.results", detections) == 0){
                     detected = (std::find_if(
@@ -103,8 +506,6 @@ std::basic_ostringstream<char> capture_frame(RPiCamJpegApp &app)
                     ) != detections.end());
             }
 
-            std::cout << detected << std::endl;
-
             Stream *stream = app.StillStream();
             StreamInfo info = app.GetStreamInfo(stream);
             BufferReadSync r(&app, completed_request->buffers[stream]);
@@ -113,90 +514,14 @@ std::basic_ostringstream<char> capture_frame(RPiCamJpegApp &app)
             break;
         }
     }
-    return buff;
+
+    return detected;
 }
 
 
-void send_frame(RPiCamJpegApp &app, std::string &buff)
+std::string get_iso_datetime(std::chrono::time_point<std::chrono::system_clock> tp)
 {
-    using namespace std;
-
-    const int  QOS = 1;
-
-    StillOptions const * options = app.GetOptions();
-/*
-    // Note that we don't actually need to open the trust or key stores.
-    // We just need a quick, portable way to check that they exist.
-    {
-        ifstream tstore(TRUST_STORE);
-        if (!tstore) {
-            cerr << "The trust store file does not exist: " << TRUST_STORE << endl;
-            cerr << "  Get a copy from \"paho.mqtt.c/test/ssl/test-root-ca.crt\"" << endl;
-            return 1;
-        }
-
-        ifstream kstore(KEY_STORE);
-        if (!kstore) {
-            cerr << "The key store file does not exist: " << KEY_STORE << endl;
-            cerr << "  Get a copy from \"paho.mqtt.c/test/ssl/client.pem\"" << endl;
-            return 1;
-        }
-    }
-*/
-    cout << "Initializing for server '" << options->Get().mqtt_host << "'..." << endl;
-    mqtt::async_client client(options->Get().mqtt_host, options->Get().mqtt_client_id);
-
-    callback cb;
-    client.set_callback(cb);
-/*
-    // Build the connect options, including SSL and a LWT message.
-    auto sslopts = mqtt::ssl_options_builder()
-                       .trust_store(TRUST_STORE)
-                       .key_store(KEY_STORE)
-                       .error_handler([](const std::string &msg) { std::cerr << "SSL Error: " << msg << std::endl; })
-                       .finalize();
-*/
-    auto connopts = mqtt::connect_options_builder()
-                        .user_name("testuser")
-                        .password("testpassword")
-                        //.ssl(std::move(sslopts))
-                        .finalize();
-
-    cout << "  ...OK" << endl;
-
-    try {
-        // Connect using SSL/TLS
-        cout << "\nConnecting..." << endl;
-        mqtt::token_ptr conntok = client.connect(connopts);
-        cout << "Waiting for the connection..." << endl;
-        conntok->wait();
-        cout << "  ...OK" << endl;
-
-        // Send a message
-        cout << "\nSending message to topic " << options->Get().mqtt_topic  << endl;
-        auto msg = mqtt::make_message(options->Get().mqtt_topic, buff, QOS, false);
-        client.publish(msg)->wait_for(20000);
-        cout << "  ...OK" << endl;
-
-        // Disconnect
-
-        cout << "\nDisconnecting..." << endl;
-        client.disconnect()->wait();
-        cout << "  ...OK" << endl;
-    }
-    catch (const mqtt::exception &exc) {
-        cerr << exc.what() << endl;
-        return;
-    }
-
-    return;
-}
-
-
-std::string get_iso_datetime()
-{
-    auto now = std::chrono::system_clock::now();
-    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    std::time_t now_time = std::chrono::system_clock::to_time_t(tp);
 
     std::stringstream ss;
     ss << std::put_time(std::gmtime(&now_time), "%Y-%m-%dT%H:%M:%SZ");
@@ -313,7 +638,76 @@ sensor_data_t read_sensors()
 
     close(file);
 
+    TSL2591::TSL2591_Sensor light_sensor{ std::string("/dev/i2c-1"), 0x29 };
+    light_sensor.setup();
+    sd.als_data = light_sensor.read_als(TSL2591::TSL2591_Sensor::CHANNEL::CH0);
+
     return sd;
+}
+
+
+void print_settings()
+{
+    std::cout << "ca_certificate_file: " << G_config.ca_certificate_file << std::endl;
+    std::cout << "data_topic: " << G_config.data_topic << std::endl;
+    std::cout << "config_topic: " << G_config.config_topic << std::endl;
+    std::cout << "wakeup_interval: " << G_config.wakeup_interval << std::endl;
+    std::cout << "stay_awake: " << G_config.stay_awake << std::endl;
+}
+
+
+inline uint8_t to_bcd(uint8_t val)
+{
+    return static_cast<uint8_t>((val / 10 << 4) | (val % 10));
+}
+
+
+std::chrono::time_point<std::chrono::system_clock> set_next_wakeup(unsigned wakeup_interval)
+{
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    auto local = * std::localtime(& time_t_now);
+
+    I2C_Device witty{ "/dev/i2c-1", 0x08 };
+
+    std::array<uint8_t, 7> buffer_n{
+        to_bcd(local.tm_sec),
+        to_bcd(local.tm_min),
+        to_bcd(local.tm_hour),
+        to_bcd(local.tm_mday),
+        to_bcd(local.tm_wday),
+        to_bcd(local.tm_mon + 1),
+        to_bcd(local.tm_year % 100)
+    };
+
+    // Witty does not support multi-register writes, so we need to stop RTC
+    // to keep time consistency
+    witty.write8(54, 0x40);  // Set STOP bit
+    for( int i = 0; i < buffer_n.size(); ++i )
+    {
+        witty.write8(58 + i, buffer_n[i]);
+    }
+    witty.write8(54, 0x00);  // Clear STOP bit
+
+    auto next = now + std::chrono::minutes(wakeup_interval);
+    auto time_t_next = std::chrono::system_clock::to_time_t(next);
+    auto local_next = * std::localtime(& time_t_next);
+
+    std::array<uint8_t, 4> buffer_m{
+        to_bcd(local_next.tm_sec),
+        to_bcd(local_next.tm_min),
+        to_bcd(local_next.tm_hour),
+        to_bcd(local_next.tm_mday),
+    };
+
+    for( int i = 0; i < buffer_m.size(); ++i ) { witty.write8(27 + i, buffer_m[i]); }
+
+    // Clear Alarms
+    witty.write8(55, witty.read8(55) & 0xbf);
+    witty.write8(39, 0);
+    witty.write8(40, 0);
+
+    return next;
 }
 
 
@@ -328,20 +722,50 @@ int main(int argc, char *argv[])
                 throw std::runtime_error("output file name required");
             }
 
-            std::basic_ostringstream<char> buff = capture_frame(app);
+            MQTTAgent mqtt_agent{ options->Get().mqtt_host, options->Get().mqtt_client_id };
+
+            mqtt_agent.connect();
+            mqtt_agent.subscribe();
+
+            try{
+                std::string config_str = mqtt_agent.receive_config();
+                nlohmann::json config = nlohmann::json::parse(config_str);
+
+                G_config.wakeup_interval = config.value("wakeup_interval", 30);
+                G_config.stay_awake = config.value("stay_awake", false);
+            }
+            catch( std::exception const & e )
+            {
+                std::cerr << "Can not parse new config: " << e.what() << std::endl;
+            }
+
+            print_settings();
+
+            sensor_data_t sd { read_sensors() };
+
+            auto next_wakeup = set_next_wakeup(G_config.wakeup_interval);
+
+            std::basic_ostringstream<char> buff{ std::ios::binary };
+
+            bool person_detected = capture_frame(app, buff);
 
             // Create keys (text strings)
+            constexpr uint8_t N{ 9 };
             cbor_item_t* key_cnode_id = cbor_build_string("cnode_id");
             cbor_item_t* key_created = cbor_build_string("created");
             cbor_item_t* key_frame = cbor_build_string("frame");
             cbor_item_t* key_temperature = cbor_build_string("temperature");
             cbor_item_t* key_battery_voltage = cbor_build_string("battery_voltage");
             cbor_item_t* key_current = cbor_build_string("current");
+            cbor_item_t* key_light = cbor_build_string("ALS_DATA");
+            cbor_item_t* key_person_detected = cbor_build_string("person_detected");
+            cbor_item_t* key_next_wakeup = cbor_build_string("next_wakeup");
 
             // Create values
             cbor_item_t* val_cnode_id = cbor_build_string("1");
-            auto timestamp = get_iso_datetime();
-            cbor_item_t* val_created = cbor_build_string(timestamp.c_str());
+            cbor_item_t* val_created = cbor_build_string(
+                get_iso_datetime(std::chrono::system_clock::now()).c_str()
+            );
             // Binary data as byte string
             auto frame = buff.str();
             cbor_item_t* val_binary = cbor_build_bytestring(
@@ -349,22 +773,29 @@ int main(int argc, char *argv[])
                 frame.length()
             );
 
-            sensor_data_t sd { read_sensors() };
             // Temperature
             cbor_item_t* val_temperature = cbor_build_float4(sd.temperature);
             // Battery
             cbor_item_t* val_battery_voltage = cbor_build_float4(sd.voltage);
             // Current
             cbor_item_t* val_current = cbor_build_float4(sd.current);
+            // Light
+            cbor_item_t* val_light = cbor_build_uint16(sd.als_data);
+            // Person detected
+            cbor_item_t* val_person_detected = cbor_build_bool(person_detected);
+            // Next wakeup
+            cbor_item_t* val_next_wakeup = cbor_build_string(get_iso_datetime(next_wakeup).c_str());
 
-            cbor_item_t* map = cbor_new_definite_map(6);
-
-            cbor_map_add(map, (struct cbor_pair){ .key = key_cnode_id, .value = val_cnode_id });
-            cbor_map_add(map, (struct cbor_pair){ .key = key_created, .value = val_created });
-            cbor_map_add(map, (struct cbor_pair){ .key = key_frame, .value = val_binary });
-            cbor_map_add(map, (struct cbor_pair){ .key = key_temperature, .value = val_temperature });
-            cbor_map_add(map, (struct cbor_pair){ .key = key_battery_voltage, .value = val_battery_voltage });
-            cbor_map_add(map, (struct cbor_pair){ .key = key_current, .value = val_current });
+            cbor_item_t* map = cbor_new_definite_map(N);
+            cbor_map_add(map, cbor_pair{ key_cnode_id, val_cnode_id });
+            cbor_map_add(map, cbor_pair{ key_created, val_created });
+            cbor_map_add(map, cbor_pair{ key_frame, val_binary });
+            cbor_map_add(map, cbor_pair{ key_temperature, val_temperature });
+            cbor_map_add(map, cbor_pair{ key_battery_voltage, val_battery_voltage });
+            cbor_map_add(map, cbor_pair{ key_current, val_current });
+            cbor_map_add(map, cbor_pair{ key_light, val_light });
+            cbor_map_add(map, cbor_pair{ key_person_detected, val_person_detected });
+            cbor_map_add(map, cbor_pair{ key_next_wakeup, val_next_wakeup });
 
             // Serialize the map
             unsigned char *buffer = nullptr;
@@ -381,7 +812,7 @@ int main(int argc, char *argv[])
                 reinterpret_cast<char *>(buffer + buffer_size)
             );
 
-            send_frame(app, payload);
+            mqtt_agent.send(G_config.data_topic, payload);
 
             free(buffer);
             cbor_decref(&map);
@@ -391,5 +822,8 @@ int main(int argc, char *argv[])
         LOG_ERROR("ERROR: *** " << e.what() << " ***");
         return -1;
     }
+
+    if( ! G_config.stay_awake ){ system("sudo /usr/bin/systemctl poweroff -i"); } // --force
+
     return 0;
 }
