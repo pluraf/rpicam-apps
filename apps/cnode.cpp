@@ -187,9 +187,6 @@ public:
             throw std::runtime_error("I2C Bus Operation Failed!");
         }
 
-        std::cout << std::hex << (int)buffer[0] << std::endl;
-        std::cout << std::hex << (int)buffer[1] << std::endl;
-
         return (buffer[1] << 8) | buffer[0];
     }
 };
