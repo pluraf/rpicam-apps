@@ -29,6 +29,9 @@
 #include "post_processing_stages/object_detect.hpp"
 
 
+using json = nlohmann::json;
+
+
 template< uint8_t End, uint8_t Start >
 struct BitField
 {
@@ -271,7 +274,7 @@ class TSL2591_Sensor: public I2C_Device
 {
 public:
 
-    TSL2591_Sensor(std::string const & i2c_bus, int const i2c_address)
+    TSL2591_Sensor(std::string const & i2c_bus, int const i2c_address = 0x29)
             :I2C_Device(i2c_bus, i2c_address)
     {}
 
@@ -335,7 +338,7 @@ public:
         write8(reg_addr.VALUE(), reg_val.VALUE());
     }
 
-    void enable_interrupt()
+    void enable_interrupt(uint16_t threshold)
     {
         using namespace TSL2591;
 
@@ -354,14 +357,15 @@ public:
             .SET(REG_COMMAND::TRANSACTION_FIELD, REG_COMMAND::TRANSACTION_NORMAL);
 
         reg_val
-            .RESET();
-        reg_addr.SET(REG_COMMAND::ADDR_SF_FIELD, REG_NPAIHTH::ADDR);
+            .SET(static_cast<uint8_t>(threshold >> 8));
+        reg_addr
+            .SET(REG_COMMAND::ADDR_SF_FIELD, REG_NPAIHTH::ADDR);
         write8(reg_addr.VALUE(), reg_val.VALUE());
 
         reg_val
-            .RESET()
-            .SET(0xFF);
-        reg_addr.SET(REG_COMMAND::ADDR_SF_FIELD, REG_NPAIHTL::ADDR);
+            .SET(static_cast<uint8_t>(threshold));
+        reg_addr
+            .SET(REG_COMMAND::ADDR_SF_FIELD, REG_NPAIHTL::ADDR);
         write8(reg_addr.VALUE(), reg_val.VALUE());
 
         reg_val
@@ -369,10 +373,28 @@ public:
             .SET(REG_ENABLE::PON)
             .SET(REG_ENABLE::AEN)
             .SET(REG_ENABLE::NPIEN);
-        reg_addr.SET(REG_COMMAND::ADDR_SF_FIELD, REG_ENABLE::ADDR);
+        reg_addr
+            .SET(REG_COMMAND::ADDR_SF_FIELD, REG_ENABLE::ADDR);
         write8(reg_addr.VALUE(), reg_val.VALUE());
+    }
 
-        std::cout << "SETUP DONE" << std::endl;
+    void disable_interrupt()
+    {
+        using namespace TSL2591;
+
+        REG<uint8_t> reg_val;
+        REG<uint8_t> reg_addr;
+
+        reg_val
+            .RESET()
+            .SET(REG_ENABLE::PON)
+            .SET(REG_ENABLE::AEN);
+        reg_addr
+            .RESET()
+            .SET(REG_COMMAND::CMD_FIELD)
+            .SET(REG_COMMAND::TRANSACTION_FIELD, REG_COMMAND::TRANSACTION_NORMAL)
+            .SET(REG_COMMAND::ADDR_SF_FIELD, REG_ENABLE::ADDR);
+        write8(reg_addr.VALUE(), reg_val.VALUE());
     }
 };
 
@@ -381,11 +403,176 @@ public:
 
 struct CNodeConfig
 {
+private:
+    std::string factory_sid;
+    std::string factory_mqtt_server;
+    std::string factory_mqtt_client_id;
+    std::string factory_mqtt_password;
+    std::string factory_config_topic;
+    std::string factory_data_topic;
+
+    void substitute(std::string & target)
+    {
+        static std::string const id_tmpl { "{{ID}}" };
+        auto pos = target.find(id_tmpl);
+        if( pos != std::string::npos )
+        {
+            target.replace(pos, id_tmpl.size(), factory_sid);
+        }
+    }
+
+public:
     bool stay_awake{ false };
     uint32_t wakeup_interval{ 30 };  // minutes
-    std::string ca_certificate_file;
-    std::string config_topic { "/cnode/1/config" };
-    std::string data_topic { "/cnode/1/data" };
+    uint32_t fallback_wakeup_interval{ 60 };
+    uint16_t person_wakeup_interval{ 2 };
+    uint16_t light_threshold{ 100 };
+    std::string ca_certificate_file { "/usr/local/share/ca-certificates/ca.crt" };
+    std::string config_topic;
+    std::string data_topic;
+
+    CNodeConfig()
+    {
+        load_fuses();
+
+        substitute(factory_config_topic);
+        substitute(factory_data_topic);
+        substitute(factory_mqtt_client_id);
+    }
+
+    bool operator==( CNodeConfig const & other ) const
+    {
+        return stay_awake == other.stay_awake
+                && wakeup_interval == other.wakeup_interval
+                && fallback_wakeup_interval == other.fallback_wakeup_interval
+                && person_wakeup_interval == other.person_wakeup_interval
+                && light_threshold == other.light_threshold
+                && config_topic == other.config_topic
+                && data_topic == other.data_topic;
+    }
+
+    bool operator!=( CNodeConfig const & other) const = default;
+
+    std::string get_mqtt_client_id(){ return factory_mqtt_client_id; }
+    std::string get_mqtt_server(){ return factory_mqtt_server; }
+    std::string get_mqtt_password(){ return factory_mqtt_password; }
+
+    void load_fuses()
+    {
+        std::string path{ "/etc/cnode/cnode.conf" };
+        std::ifstream file(path);
+
+        if( ! file )
+        {
+            std::cerr << "Failed to open fuses file: " << path << std::endl;
+            return;
+        }
+
+        std::string line;
+        int ix {};
+        while( std::getline(file, line) )
+        {
+            if( line.starts_with("#") ){ continue; }
+
+            switch( ix )
+            {
+            case 0: factory_sid = line; break;
+            case 1: factory_mqtt_server = line; break;
+            case 2: factory_mqtt_password = line; break;
+            case 3: factory_mqtt_client_id = line; break;
+            case 4: factory_config_topic = line; break;
+            case 5: factory_data_topic = line; break;
+            }
+
+            ++ix;
+        }
+    }
+
+    void load()
+    {
+        init();  // Load factory settings
+
+        std::string path{ "cnode-config.json" };
+        std::ifstream file(path);
+        if( ! file )
+        {
+            std::cerr << "Failed to open config file: " << path << std::endl;
+            return;
+        }
+
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        file.close();
+
+        auto config = nlohmann::json::parse(buffer.str());
+
+        init(config);  // Override factory settings
+    }
+
+    void store()
+    {
+        nlohmann::json config;
+
+        std::string path{ "cnode-config.json" };
+
+        config["stay_awake"] = stay_awake;
+        config["wakeup_interval"] = wakeup_interval;
+        config["fallback_wakeup_interval"] = fallback_wakeup_interval;
+        config["person_wakeup_interval"] = person_wakeup_interval;
+        config["light_threshold"] = light_threshold;
+        config["config_topic"] = config_topic;
+        config["data_topic"] = data_topic;
+
+        auto data = config.dump(4);
+
+        std::ofstream ofs(path);
+        if( ofs.is_open() )
+        {
+            ofs << data;
+            ofs.close();
+        }
+        else{
+            std::cerr << "Failed to open config file: " << path << std::endl;
+        }
+    }
+
+    void init()
+    {
+        data_topic = factory_data_topic;
+        config_topic = factory_config_topic;
+    }
+
+    void init(json const & config)
+    {
+        stay_awake = config.value("stay_awake", stay_awake);
+        wakeup_interval = config.value("wakeup_interval", wakeup_interval);
+        fallback_wakeup_interval = config.value("fallback_wakeup_interval", fallback_wakeup_interval);
+        person_wakeup_interval = config.value("person_wakeup_interval", person_wakeup_interval);
+        light_threshold = config.value("light_threshold", light_threshold);
+        data_topic = config.value("data_topic", data_topic);
+        config_topic = config.value("config_topic", config_topic);
+    }
+
+    void update(json const & config)
+    {
+        auto curr = * this;
+        init(config);
+
+        if( curr != * this ){ store(); }
+    }
+
+    void print()
+    {
+        std::cout << "ca_certificate_file: " << ca_certificate_file << std::endl;
+        std::cout << "data_topic: " << data_topic << std::endl;
+        std::cout << "config_topic: " << config_topic << std::endl;
+        std::cout << "wakeup_interval: " << wakeup_interval << std::endl;
+        std::cout << "fallback_wakeup_interval: " << fallback_wakeup_interval << std::endl;
+        std::cout << "person_wakeup_interval: " << person_wakeup_interval << std::endl;
+        std::cout << "light_threshold: " << light_threshold << std::endl;
+        std::cout << "stay_awake: " << stay_awake << std::endl;
+    }
+
 } G_config;
 
 
@@ -409,14 +596,14 @@ public:
         conn_opts.set_clean_session(false);
         conn_opts.set_mqtt_version(MQTTVERSION_5);
 
-        conn_opts.set_user_name("testuser");
-        conn_opts.set_password("testpassword");
+        conn_opts.set_user_name("");
+        conn_opts.set_password(G_config.get_mqtt_password());
 
         auto server = client_ptr_->get_server_uri();
 
         if(server.starts_with("ssl") || server.starts_with("tls")){
             mqtt::ssl_options sslopts;
-            sslopts.set_verify(true);
+            sslopts.set_verify(false);  // FIXME:
             sslopts.set_enable_server_cert_auth(true);
             sslopts.set_trust_store(G_config.ca_certificate_file);
             conn_opts.set_ssl(sslopts);
@@ -506,11 +693,14 @@ bool capture_frame(RPiCamJpegApp & app, std::basic_ostringstream<char> & buff)
                     ) != detections.end());
             }
 
-            Stream *stream = app.StillStream();
-            StreamInfo info = app.GetStreamInfo(stream);
-            BufferReadSync r(&app, completed_request->buffers[stream]);
-            const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
-            jpeg_write(mem, info, completed_request->metadata, buff, app.CameraModel(), options);
+            if( ! detected )
+            {
+                Stream *stream = app.StillStream();
+                StreamInfo info = app.GetStreamInfo(stream);
+                BufferReadSync r(&app, completed_request->buffers[stream]);
+                const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
+                jpeg_write(mem, info, completed_request->metadata, buff, app.CameraModel(), options);
+            }
             break;
         }
     }
@@ -646,16 +836,6 @@ sensor_data_t read_sensors()
 }
 
 
-void print_settings()
-{
-    std::cout << "ca_certificate_file: " << G_config.ca_certificate_file << std::endl;
-    std::cout << "data_topic: " << G_config.data_topic << std::endl;
-    std::cout << "config_topic: " << G_config.config_topic << std::endl;
-    std::cout << "wakeup_interval: " << G_config.wakeup_interval << std::endl;
-    std::cout << "stay_awake: " << G_config.stay_awake << std::endl;
-}
-
-
 inline uint8_t to_bcd(uint8_t val)
 {
     return static_cast<uint8_t>((val / 10 << 4) | (val % 10));
@@ -707,22 +887,38 @@ std::chrono::time_point<std::chrono::system_clock> set_next_wakeup(unsigned wake
     witty.write8(39, 0);
     witty.write8(40, 0);
 
+    // Pulse interval in seconds, when Raspberry Pi is off.
+    witty.write8(18, 240);
+
     return next;
+}
+
+
+void shutdown()
+{
+    if( ! G_config.stay_awake )
+    {
+        system("sudo /usr/bin/systemctl poweroff -i"); // --force
+    }
 }
 
 
 int main(int argc, char *argv[])
 {
+    G_config.load();
+    G_config.print();
+
+    // Set fallback wakeup in case something goes wrong
+    // std::chrono::time_point<std::chrono::system_clock>
+    auto next_wakeup = set_next_wakeup(G_config.fallback_wakeup_interval);
+
     try {
         RPiCamJpegApp app;
         StillOptions *options = app.GetOptions();
         if (options->Parse(argc, argv)) {
             if (options->Get().verbose >= 2) { options->Get().Print(); }
-            if (options->Get().output.empty()) {
-                throw std::runtime_error("output file name required");
-            }
 
-            MQTTAgent mqtt_agent{ options->Get().mqtt_host, options->Get().mqtt_client_id };
+            MQTTAgent mqtt_agent{ G_config.get_mqtt_server(), G_config.get_mqtt_client_id() };
 
             mqtt_agent.connect();
             mqtt_agent.subscribe();
@@ -731,23 +927,38 @@ int main(int argc, char *argv[])
                 std::string config_str = mqtt_agent.receive_config();
                 nlohmann::json config = nlohmann::json::parse(config_str);
 
-                G_config.wakeup_interval = config.value("wakeup_interval", 30);
-                G_config.stay_awake = config.value("stay_awake", false);
+                G_config.update(config);
             }
             catch( std::exception const & e )
             {
                 std::cerr << "Can not parse new config: " << e.what() << std::endl;
             }
 
-            print_settings();
+            G_config.print();
 
             sensor_data_t sd { read_sensors() };
 
-            auto next_wakeup = set_next_wakeup(G_config.wakeup_interval);
+            TSL2591::TSL2591_Sensor light_sensor{"/dev/i2c-1"};
 
             std::basic_ostringstream<char> buff{ std::ios::binary };
 
-            bool person_detected = capture_frame(app, buff);
+            bool person_detected { false };
+
+            if( sd.als_data < G_config.light_threshold )  // No light
+            {
+                light_sensor.enable_interrupt(G_config.light_threshold);
+            }
+            else{
+                light_sensor.disable_interrupt();
+                person_detected = capture_frame(app, buff);
+                if( person_detected )
+                {
+                    next_wakeup = set_next_wakeup(G_config.person_wakeup_interval);
+                }
+                else{
+                    next_wakeup = set_next_wakeup(G_config.wakeup_interval);
+                }
+            }
 
             // Create keys (text strings)
             constexpr uint8_t N{ 9 };
@@ -762,6 +973,7 @@ int main(int argc, char *argv[])
             cbor_item_t* key_next_wakeup = cbor_build_string("next_wakeup");
 
             // Create values
+
             cbor_item_t* val_cnode_id = cbor_build_string("1");
             cbor_item_t* val_created = cbor_build_string(
                 get_iso_datetime(std::chrono::system_clock::now()).c_str()
@@ -772,7 +984,6 @@ int main(int argc, char *argv[])
                 reinterpret_cast<cbor_data>(frame.c_str()),
                 frame.length()
             );
-
             // Temperature
             cbor_item_t* val_temperature = cbor_build_float4(sd.temperature);
             // Battery
@@ -823,7 +1034,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    if( ! G_config.stay_awake ){ system("sudo /usr/bin/systemctl poweroff -i"); } // --force
+    shutdown();
 
     return 0;
 }
