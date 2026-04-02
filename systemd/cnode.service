@@ -1,0 +1,13 @@
+[Unit]
+Description=C-Node Service
+Wants=network.target
+After=multi-user.target
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cnode.sh
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

@@ -404,11 +404,10 @@ public:
 
 }
 
-/*
+
 class GPIOController
 {
     static constexpr char const * GPIO_CHIP_0 = "/dev/gpiochip0";
-    static constexpr unsigned POWER_UP = 13; // GPIO13
     static constexpr unsigned MODEM_PWR = 6;  // GPIO6
     static constexpr unsigned MODEM_RST = 24;  // GPIO24
 
@@ -417,19 +416,19 @@ class GPIOController
     std::pair<std::unique_ptr<line_request>, unsigned> rst_line_;
     std::pair<std::unique_ptr<line_request>, unsigned> pwr_line_;
 public:
-    RMachine()
+    GPIOController()
     {
 
         request_config rc;
         rc.set_consumer("C-Node");
 
-        // Set MODEM_RST
         line_settings ls;
         ls.set_direction(line::direction::OUTPUT);
         ls.set_drive(line::drive::PUSH_PULL);
-        ls.set_output_value(line::value::INACTIVE);
 
+        // Set MODEM_RST
         line_config lc;
+        ls.set_output_value(line::value::INACTIVE);
         lc.add_line_settings(MODEM_RST, ls);
 
         request_builder rb {chip0_.prepare_request()};
@@ -439,32 +438,16 @@ public:
 
         // Set MODEM_PWR
         lc.reset();
-        lc.add_line_settings(GPIO_LED_NEG, ls);
+        ls.set_output_value(line::value::ACTIVE);
+        lc.add_line_settings(MODEM_PWR, ls);
 
         rb = chip0_.prepare_request();
         rb.set_request_config(rc);
         rb.set_line_config(lc);
-        led_line_neg_ = make_pair(make_unique<line_request>(rb.do_request()), GPIO_LED_NEG);
-
-        // SET GPIO_RST_LINE
-        ls.reset();
-        lc.reset();
-
-        ls.set_direction(line::direction::INPUT);
-        ls.set_bias(line::bias::DISABLED);
-        chrono::microseconds period{20000};
-        ls.set_debounce_period(period);
-        ls.set_edge_detection(line::edge::FALLING);
-
-        lc.add_line_settings(GPIO_RST_LINE, ls);
-
-        rb = chip0_.prepare_request();
-        rb.set_request_config(rc);
-        rb.set_line_config(lc);
-        rst_line_ = make_pair(make_unique<line_request>(rb.do_request()), GPIO_RST_LINE);
+        pwr_line_ = make_pair(make_unique<line_request>(rb.do_request()), MODEM_PWR);
     }
 };
-*/
+
 
 struct CNodeConfig
 {
