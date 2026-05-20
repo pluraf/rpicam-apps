@@ -1,0 +1,9 @@
+{
+    "config_topic": "/cnode/1/config",
+    "data_topic": "/cnode/1/data",
+    "fallback_wakeup_interval": 600,
+    "light_threshold": 20,
+    "person_wakeup_interval": 2,
+    "stay_awake": true,
+    "wakeup_interval": 180
+}
