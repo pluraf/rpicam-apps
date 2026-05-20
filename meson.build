@@ -4,7 +4,7 @@ project('rpicam-apps', 'c', 'cpp',
         default_options : [
             'werror=false',
             'warning_level=3',
-            'cpp_std=c++20',
+            'cpp_std=c++23',
             'c_std=c11',
             'buildtype=debug',
         ],

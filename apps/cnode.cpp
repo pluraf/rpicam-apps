@@ -15,8 +15,10 @@
 #include <string>
 #include <thread>
 #include <array>
+#include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <linux/i2c-dev.h>
 #include <gpiod.hpp>
 
@@ -99,6 +101,13 @@ struct sensor_data_t
 };
 
 
+struct i2c_error: public std::runtime_error
+{
+    i2c_error(std::string const & arg): std::runtime_error(arg) { }
+    i2c_error(char const * arg): std::runtime_error(arg) { }
+};
+
+
 class I2C_Device
 {
 protected:
@@ -110,13 +119,13 @@ public:
         handler_ = open(i2c_bus.c_str(), O_RDWR);
         if( handler_ < 0 )
         {
-            throw std::runtime_error("Failed to open I2C bus!");
+            throw i2c_error("Failed to open I2C bus!");
         }
 
         if( ioctl(handler_, I2C_SLAVE, i2c_address) < 0 )
         {
             close(handler_);
-            throw std::runtime_error("Failed to acquire I2C bus access!");
+            throw i2c_error("Failed to acquire I2C bus access!");
         }
     }
 
@@ -129,7 +138,7 @@ public:
     {
         if( write(handler_, buffer, n) != n )
         {
-            throw std::runtime_error("I2C Bus Operation Failed!");
+            throw i2c_error("I2C Bus Operation Failed!");
         }
     }
 
@@ -141,7 +150,7 @@ public:
 
         if( write(handler_, buffer, N) != N )
         {
-            throw std::runtime_error("I2C Bus Operation Failed!");
+            throw i2c_error("I2C Bus Operation Failed!");
         }
     }
 
@@ -153,7 +162,7 @@ public:
 
         if( write(handler_, buffer, N) != N )
         {
-            throw std::runtime_error("I2C Bus Operation Failed!");
+            throw i2c_error("I2C Bus Operation Failed!");
         }
     }
 
@@ -161,7 +170,7 @@ public:
     {
         if( write(handler_, & addr, 1) != 1 )
         {
-            throw std::runtime_error("I2C Bus Operation Failed!");
+            throw i2c_error("I2C Bus Operation Failed!");
         }
 
         constexpr unsigned N = 1;
@@ -170,7 +179,7 @@ public:
 
         if( read(handler_, buffer, N) != N )
         {
-            throw std::runtime_error("I2C Bus Operation Failed!");
+            throw i2c_error("I2C Bus Operation Failed!");
         }
 
         return buffer[0];
@@ -180,7 +189,7 @@ public:
     {
         if( write(handler_, & addr, 1) != 1 )
         {
-            throw std::runtime_error("I2C Bus Operation Failed!");
+            throw i2c_error("I2C Bus Operation Failed!");
         }
 
         constexpr unsigned N = 2;
@@ -189,7 +198,7 @@ public:
 
         if( read(handler_, buffer, N) != N )
         {
-            throw std::runtime_error("I2C Bus Operation Failed!");
+            throw i2c_error("I2C Bus Operation Failed!");
         }
 
         return (buffer[1] << 8) | buffer[0];
@@ -434,7 +443,7 @@ public:
         request_builder rb {chip0_.prepare_request()};
         rb.set_request_config(rc);
         rb.set_line_config(lc);
-        rst_line_ = make_pair(make_unique<line_request>(rb.do_request()), MODEM_RST);
+        rst_line_ = std::make_pair(std::make_unique<line_request>(rb.do_request()), MODEM_RST);
 
         // Set MODEM_PWR
         lc.reset();
@@ -444,7 +453,7 @@ public:
         rb = chip0_.prepare_request();
         rb.set_request_config(rc);
         rb.set_line_config(lc);
-        pwr_line_ = make_pair(make_unique<line_request>(rb.do_request()), MODEM_PWR);
+        pwr_line_ = std::make_pair(std::make_unique<line_request>(rb.do_request()), MODEM_PWR);
     }
 };
 
@@ -676,6 +685,11 @@ public:
         client_ptr_->subscribe(G_config.config_topic, 1);
     }
 
+    void disconnect()
+    {
+        client_ptr_->disconnect(5000);
+    }
+
     std::string receive_config()
     {
         mqtt::const_message_ptr msg;
@@ -731,12 +745,13 @@ bool capture_frame(RPiCamJpegApp & app, std::basic_ostringstream<char> & buff)
             CompletedRequestPtr & completed_request = std::get<CompletedRequestPtr>(msg.payload);
 
             std::vector<Detection> detections;
-            if(completed_request->post_process_metadata.Get(
-                "object_detect.results", detections) == 0){
+            if( completed_request->post_process_metadata.Get("object_detect.results", detections) == 0 )
+            {
                     detected = (std::find_if(
                         detections.begin(),
                         detections.end(),
-                        [options](const Detection &d){
+                        [options](const Detection &d)
+                        {
                             return d.name.find(options->Get().object) != std::string::npos;
                         }
                     ) != detections.end());
@@ -943,8 +958,10 @@ std::chrono::time_point<std::chrono::system_clock> set_next_wakeup(unsigned wake
 }
 
 
-void shutdown()
+void poweroff()
 {
+    sync();
+
     if( ! G_config.stay_awake )
     {
         system("sudo /usr/bin/systemctl poweroff -i"); // --force
@@ -959,11 +976,21 @@ int main(int argc, char *argv[])
 
     // Set fallback wakeup in case something goes wrong
     // std::chrono::time_point<std::chrono::system_clock>
-    auto next_wakeup = set_next_wakeup(G_config.fallback_wakeup_interval);
+    std::chrono::time_point<std::chrono::system_clock> next_wakeup;
+    try
+    {
+        next_wakeup = set_next_wakeup(G_config.fallback_wakeup_interval);
+    }
+    catch(i2c_error const & e)
+    {
+        std::cerr << e.what() << std::endl;
+    }
 
-    try {
-        RPiCamJpegApp app;
-        StillOptions *options = app.GetOptions();
+    RPiCamJpegApp app;
+    StillOptions *options = app.GetOptions();
+
+    try
+    {
         if (options->Parse(argc, argv)) {
             if (options->Get().verbose >= 2) { options->Get().Print(); }
 
@@ -985,28 +1012,35 @@ int main(int argc, char *argv[])
 
             G_config.print();
 
-            sensor_data_t sd { read_sensors() };
-
-            TSL2591::TSL2591_Sensor light_sensor{"/dev/i2c-1"};
-
             std::basic_ostringstream<char> buff{ std::ios::binary };
-
+            sensor_data_t sd;
             bool person_detected { false };
 
-            if( sd.als_data < G_config.light_threshold )  // No light
+            try
             {
-                light_sensor.enable_interrupt(G_config.light_threshold);
-            }
-            else{
-                light_sensor.disable_interrupt();
-                person_detected = capture_frame(app, buff);
-                if( person_detected )
+                sd = read_sensors();
+
+                TSL2591::TSL2591_Sensor light_sensor{"/dev/i2c-1"};
+
+                if( sd.als_data < G_config.light_threshold )  // No light
                 {
-                    next_wakeup = set_next_wakeup(G_config.person_wakeup_interval);
+                    light_sensor.enable_interrupt(G_config.light_threshold);
                 }
                 else{
-                    next_wakeup = set_next_wakeup(G_config.wakeup_interval);
+                    light_sensor.disable_interrupt();
+                    person_detected = capture_frame(app, buff);
+                    if( person_detected )
+                    {
+                        next_wakeup = set_next_wakeup(G_config.person_wakeup_interval);
+                    }
+                    else{
+                        next_wakeup = set_next_wakeup(G_config.wakeup_interval);
+                    }
                 }
+            }
+            catch(i2c_error const & e)
+            {
+                std::cerr << e.what() << std::endl;
             }
 
             // Create keys (text strings)
@@ -1073,6 +1107,7 @@ int main(int argc, char *argv[])
             );
 
             mqtt_agent.send(G_config.data_topic, payload);
+            mqtt_agent.disconnect();
 
             free(buffer);
             cbor_decref(&map);
@@ -1083,7 +1118,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    shutdown();
+    //poweroff();
 
     return 0;
 }

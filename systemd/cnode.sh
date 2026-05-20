@@ -1,25 +1,10 @@
 #!/bin/bash
 
 
-pon clipper
-sleep 2
-ip addr | grep ppp0
-
-if [ $? -ne 0 ]; then
-    pinctrl set 6 op dl
-    sleep 2
-    pinctrl set 6 op dh
-    sleep 12
-    pon clipper
-    sleep 10
-fi
-
-
-sleep 2
+/home/plrf/lte_modem /dev/ttyAMA0 on
 
 systemctl restart systemd-timesyncd
 
-sleep 2
 
 readonly HALT_PIN=19   # halt by GPIO-19 (BCM naming)
 readonly SYSUP_PIN=17  # output SYS_UP signal on GPIO-17 (BCM naming)
@@ -49,10 +34,12 @@ gpio -g mode $SYSUP_PIN in
 CNODE_DIR=/home/plrf
 CNODE_STAGES=${CNODE_DIR}/post_processing_stages
 
-export LD_LIBRARY_PATH=/home/plrf
 /home/plrf/cnode -n -t 1ms --post-process-file ${CNODE_DIR}/object_detect_tf.json --post-process-libs ${CNODE_STAGES} --lores-width 300 --lores-height 300 --object person --verbose 1
 
-sleep 10
+while tc -s qdisc show dev ppp0 | grep -q "backlog [1-9]"; do sleep 1; done
+sleep 1
 
-pinctrl set 13 ip pd
+/home/plrf/lte_modem /dev/ttyAMA0 off
+
+pinctrl set 13 ip pd  # WittyPi power-down notification
 poweroff

@@ -661,9 +661,6 @@ void RPiCamApp::Teardown()
 
 void RPiCamApp::StartCamera()
 {
-    // This makes all the Request objects that we shall need.
-    makeRequests();
-
     // Build a list of initial controls that we must set in the camera before starting it.
     // We don't overwrite anything the application may have set before calling us.
     if (!controls_.get(controls::ScalerCrop) && !controls_.get(controls::rpi::ScalerCrops))
@@ -824,16 +821,17 @@ void RPiCamApp::StartCamera()
         controls_.set(controls::AeFlickerPeriod, options_->Get().flicker_period.get<std::chrono::microseconds>());
     }
 
-    if (camera_->start(&controls_))
-        throw std::runtime_error("failed to start camera");
+    // This makes all the Request objects that we shall need.
+    camera_->requestCompleted.connect(this, &RPiCamApp::requestComplete);
+    if( camera_->start(&controls_) ){ throw std::runtime_error("failed to start camera"); }
+
     controls_.clear();
     camera_started_ = true;
     last_timestamp_ = 0;
 
     post_processor_.Start();
 
-    camera_->requestCompleted.connect(this, &RPiCamApp::requestComplete);
-
+    makeRequests();
     for (std::unique_ptr<Request> &request : requests_)
     {
         if (camera_->queueRequest(request.get()) < 0)
@@ -927,12 +925,12 @@ void RPiCamApp::queueRequest(CompletedRequest *completed_request)
         if (request->addBuffer(p.first, p.second) < 0)
             throw std::runtime_error("failed to add buffer to request in QueueRequest");
     }
-
+/*
     {
         std::lock_guard<std::mutex> lock(control_mutex_);
         request->controls() = std::move(controls_);
     }
-
+*/
     if (camera_->queueRequest(request) < 0)
         throw std::runtime_error("failed to queue request");
 }
